@@ -133,14 +133,14 @@ async def on_ready():
     group="請輸入群組名稱，相同名稱的頻道會互相轉發 (必填)"
 )
 @app_commands.choices(language=[
-    app_commands.Choice(name="🇹🇼 繁體中文", value="ZH"),
-    app_commands.Choice(name="🇺🇸 英文 (美式)", value="EN-US"),
-    app_commands.Choice(name="🇯🇵 日文", value="JA"),
-    app_commands.Choice(name="🇰🇷 韓文", value="KO"),
-    app_commands.Choice(name="🇷🇺 俄文", value="RU"),
-    app_commands.Choice(name="🇮🇩 印尼文", value="ID"),
-    app_commands.Choice(name="🇪🇸 西班牙文", value="ES"),
-    app_commands.Choice(name="🇹🇭 泰文", value="TH"),
+    app_commands.Choice(name="中文", value="ZH"),
+    app_commands.Choice(name="英文", value="EN-US"),
+    app_commands.Choice(name="日文", value="JA"),
+    app_commands.Choice(name="韓文", value="KO"),
+    app_commands.Choice(name="俄文", value="RU"),
+    app_commands.Choice(name="印尼文", value="ID"),
+    app_commands.Choice(name="西班牙文", value="ES"),
+    app_commands.Choice(name="泰文", value="TH"),
 ])
 async def setup_channel(
     interaction: discord.Interaction, 
