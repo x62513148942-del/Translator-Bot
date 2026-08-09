@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 from dotenv import load_dotenv
+from deep_translator import GoogleTranslator
 from web import keep_alive
 
 load_dotenv()
@@ -13,6 +14,19 @@ BOT_TOKEN = os.getenv("DC_BOT_TOKEN")
 DEEPL_API_KEY = os.getenv("DEEPL_API_KEY")
 CONFIG_FILE = "channel_config.json"
 
+# 語言代碼對照表 (DeepL 代碼 ➔ GoogleTranslator 代碼)
+GOOGLE_LANG_MAP = {
+    "ZH": "zh-TW",
+    "EN-US": "en",
+    "JA": "ja",
+    "KO": "ko",
+    "RU": "ru",
+    "ID": "id",
+    "ES": "es",
+    "TH": "th"
+}
+
+# 讀取頻道設定檔
 if os.path.exists(CONFIG_FILE):
     with open(CONFIG_FILE, "r", encoding="utf-8") as f:
         CHANNEL_CONFIG = {int(k): v for k, v in json.load(f).items()}
@@ -25,39 +39,50 @@ def save_config():
 
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
 
-async def translate_text(session, text, target_lang, max_retries=3):
-    if target_lang == "TH":
-        url = "https://translate.googleapis.com/translate_a/single"
-        params = {
-            "client": "gtx",
-            "sl": "auto",
-            "tl": "th",
-            "dt": "t",
-            "q": text
-        }
+# 自訂 Bot 類別以優化 Session 與 Hook 管理
+class TranslatorBot(commands.Bot):
+    def __init__(self):
+        super().__init__(command_prefix="!", intents=intents)
+        self.session = None
+
+    async def setup_hook(self):
+        # 建立全域共享的 aiohttp Session
+        self.session = aiohttp.ClientSession()
+        # 同步斜線指令
         try:
-            async with session.get(url, params=params) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return "".join([item[0] for item in data[0] if item[0]])
-                else:
-                    print(f"❌ Google 翻譯(泰文) 失敗: HTTP {resp.status}")
-                    return text
+            synced = await self.tree.sync()
+            print(f"✅ 已成功同步 {len(synced)} 個斜線指令")
         except Exception as e:
-            print(f"❌ Google 翻譯(泰文) 發生錯誤：{e}")
-            return text
+            print(f"⚠️ 同步指令失敗：{e}")
 
-    if not DEEPL_API_KEY:
-        print("❌ 未找到 DEEPL_API_KEY 環境變數！")
+    async def close(self):
+        # 關閉 Bot 時同時關閉 Session
+        if self.session:
+            await self.session.close()
+        await super().close()
+
+bot = TranslatorBot()
+
+# Google 翻譯（使用 deep-translator 搭配 asyncio.to_thread 防止阻塞）
+async def translate_with_google(text: str, target_lang: str) -> str:
+    target = GOOGLE_LANG_MAP.get(target_lang, "zh-TW")
+    try:
+        translated = await asyncio.to_thread(
+            lambda: GoogleTranslator(source='auto', target=target).translate(text)
+        )
+        return translated if translated else text
+    except Exception as e:
+        print(f"❌ Google 翻譯 ({target_lang}) 發生錯誤：{e}")
         return text
 
-    if DEEPL_API_KEY.endswith(":fx"):
-        url = "https://api-free.deepl.com/v2/translate"
-    else:
-        url = "https://api.deepl.com/v2/translate"
+# DeepL 翻譯主邏輯
+async def translate_text(session: aiohttp.ClientSession, text: str, target_lang: str, max_retries: int = 3) -> str:
+    # 泰文或沒有設定 DeepL Key 時直接走 Google 翻譯
+    if target_lang == "TH" or not DEEPL_API_KEY:
+        return await translate_with_google(text, target_lang)
 
+    url = "https://api-free.deepl.com/v2/translate" if DEEPL_API_KEY.endswith(":fx") else "https://api.deepl.com/v2/translate"
     headers = {"Authorization": f"DeepL-Auth-Key {DEEPL_API_KEY}"}
     data = {
         "text": [text],
@@ -65,22 +90,27 @@ async def translate_text(session, text, target_lang, max_retries=3):
     }
 
     for attempt in range(max_retries):
-        async with session.post(url, headers=headers, json=data) as resp:
-            if resp.status == 200:
-                result = await resp.json()
-                return result["translations"][0]["text"]
-            elif resp.status == 403:
-                print("❌ DeepL API Key 無效，請檢查 Key 是否填錯或額度已滿。")
-                return text
-            elif resp.status == 429:
-                await asyncio.sleep((attempt + 1) * 1.5)
-                continue
-            else:
-                print(f"DeepL API 錯誤: HTTP {resp.status}")
-                return text 
-    return text
+        try:
+            async with session.post(url, headers=headers, json=data) as resp:
+                if resp.status == 200:
+                    result = await resp.json()
+                    return result["translations"][0]["text"]
+                elif resp.status == 403:
+                    print("⚠️ DeepL Key 無效或額度上限，改用 Google 翻譯備援。")
+                    return await translate_with_google(text, target_lang)
+                elif resp.status == 429:
+                    await asyncio.sleep((attempt + 1) * 1.5)
+                    continue
+                else:
+                    print(f"⚠️ DeepL 錯誤 HTTP {resp.status}，改用 Google 翻譯備援。")
+                    return await translate_with_google(text, target_lang)
+        except Exception as e:
+            print(f"⚠️ DeepL 請求異常：{e}，改用 Google 翻譯備援。")
+            return await translate_with_google(text, target_lang)
 
-async def process_and_send(session, message, target_lang, target_cids):
+    return await translate_with_google(text, target_lang)
+
+async def process_and_send(session: aiohttp.ClientSession, message: discord.Message, target_lang: str, target_cids: list):
     translated_text = await translate_text(session, message.content, target_lang)
     send_text = f"**{message.author.display_name}**：{translated_text}"
     
@@ -90,16 +120,11 @@ async def process_and_send(session, message, target_lang, target_cids):
             try:
                 await target_channel.send(send_text)
             except Exception as e:
-                print(f"無法發送訊息至頻道 {cid}：{e}")
+                print(f"❌ 無法發送訊息至頻道 {cid}：{e}")
 
 @bot.event
 async def on_ready():
     print(f'🎉 成功連線！機器人名稱：{bot.user}')
-    try:
-        synced = await bot.tree.sync()
-        print(f"✅ 已成功同步 {len(synced)} 個斜線指令")
-    except Exception as e:
-        print(f"⚠️ 同步指令失敗：{e}")
 
 @bot.tree.command(name="設定頻道", description="設定翻譯機器人的連動頻道與語言")
 @app_commands.describe(
@@ -151,7 +176,7 @@ async def check_config(interaction: discord.Interaction):
     await interaction.response.send_message(msg, ephemeral=True)
 
 @bot.event
-async def on_message(message):
+async def on_message(message: discord.Message):
     if message.author.bot or not message.content.strip():
         return
 
@@ -168,14 +193,13 @@ async def on_message(message):
                     lang_to_channels[lang] = []
                 lang_to_channels[lang].append(cid)
 
-        if lang_to_channels:
-            async with aiohttp.ClientSession() as session:
-                tasks = []
-                for lang, target_cids in lang_to_channels.items():
-                    tasks.append(
-                        process_and_send(session, message, lang, target_cids)
-                    )
-                await asyncio.gather(*tasks)
+        if lang_to_channels and bot.session:
+            tasks = []
+            for lang, target_cids in lang_to_channels.items():
+                tasks.append(
+                    process_and_send(bot.session, message, lang, target_cids)
+                )
+            await asyncio.gather(*tasks)
 
     await bot.process_commands(message)
 
