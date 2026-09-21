@@ -5,8 +5,6 @@ import aiohttp
 import asyncio
 import json
 import os
-import re
-import html
 import urllib.parse
 from aiohttp import web
 
@@ -78,7 +76,7 @@ async def on_ready():
         print(f"⚠️ 同步指令失敗：{e}", flush=True)
 
 # ---------------------------------------------------------
-# 4. Google 翻譯核心功能 (採用移動版網頁 + GTX 雙重備援)
+# 4. 高穩定度翻譯核心 (Chrome API + MyMemory 雙重備援)
 # ---------------------------------------------------------
 
 GOOGLE_LANG_MAP = {
@@ -97,51 +95,44 @@ async def translate_text(text, target_lang):
         return text
 
     tl = GOOGLE_LANG_MAP.get(target_lang, target_lang.lower())
+    encoded_text = urllib.parse.quote(text)
+
+    # --- 方案 1: Chrome 瀏覽器擴充套件專用 Google 接口 (極難被 Render/AWS IP 封鎖) ---
+    url_chrome = f"https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=auto&tl={tl}&q={encoded_text}"
     headers = {
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1"
-    }
-
-    # --- 方案 A: 使用 Google 輕量移動版網頁解析 (防封鎖能力最高) ---
-    try:
-        encoded_text = urllib.parse.quote(text)
-        url = f"https://translate.google.com/m?sl=auto&tl={tl}&q={encoded_text}"
-
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, timeout=10) as resp:
-                if resp.status == 200:
-                    raw_html = await resp.text()
-                    # 正則匹配網頁中的翻譯結果區塊
-                    match = re.search(r'class="(?:result-container|t0)">(.*?)</div>', raw_html, re.DOTALL)
-                    if match:
-                        translated = html.unescape(match.group(1)).strip()
-                        print(f"🈳 Google 移動網頁翻譯成功 [{target_lang} -> {tl}]: '{text}' ➔ '{translated}'", flush=True)
-                        return translated
-                print(f"⚠️ 移動版網頁回應異常 (HTTP {resp.status})，嘗試備援管道...", flush=True)
-    except Exception as e:
-        print(f"⚠️ 移動版網頁連線錯誤: {e}，嘗試備援管道...", flush=True)
-
-    # --- 方案 B: 備援 GTX API 接口 ---
-    gtx_url = "https://translate.googleapis.com/translate_a/single"
-    params = {
-        "client": "gtx",
-        "sl": "auto",
-        "tl": tl,
-        "dt": "t",
-        "q": text
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
 
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(gtx_url, params=params, headers=headers, timeout=10) as resp:
+            async with session.get(url_chrome, headers=headers, timeout=8) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    translated = "".join(item[0] for item in data[0] if item and item[0])
-                    print(f"🈳 Google GTX 備援翻譯成功: '{text}' ➔ '{translated}'", flush=True)
-                    return translated
-                else:
-                    print(f"❌ Google GTX 備援失敗: HTTP {resp.status}", flush=True)
+                    # Response format: [['翻譯結果', '原文']] or ['翻譯結果']
+                    if isinstance(data, list) and len(data) > 0:
+                        translated = data[0][0] if isinstance(data[0], list) else data[0]
+                        if translated and translated.strip():
+                            print(f"🈳 [Chrome API] 翻譯成功 [{target_lang}]: '{text}' ➔ '{translated}'", flush=True)
+                            return translated
+                print(f"⚠️ [Chrome API] 失敗 (HTTP {resp.status})，切換至 MyMemory 備援...", flush=True)
     except Exception as e:
-        print(f"❌ Google 所有翻譯管道皆失敗: {e}", flush=True)
+        print(f"⚠️ [Chrome API] 連線例外: {e}，切換至 MyMemory 備援...", flush=True)
+
+    # --- 方案 2: MyMemory 國際免費翻譯 API (備援管道) ---
+    url_mymemory = f"https://api.mymemory.translated.net/get?q={encoded_text}&langpair=autodetect|{tl}"
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url_mymemory, timeout=8) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    translated = data.get("responseData", {}).get("translatedText")
+                    if translated and translated.strip() and translated.upper() != text.upper():
+                        print(f"🈳 [MyMemory] 翻譯成功 [{target_lang}]: '{text}' ➔ '{translated}'", flush=True)
+                        return translated
+                print(f"❌ [MyMemory] 失敗 (HTTP {resp.status})", flush=True)
+    except Exception as e:
+        print(f"❌ [MyMemory] 連線例外: {e}", flush=True)
 
     return text
 
