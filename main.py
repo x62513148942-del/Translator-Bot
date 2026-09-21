@@ -76,76 +76,81 @@ async def on_ready():
         print(f"⚠️ 同步指令失敗：{e}", flush=True)
 
 # ---------------------------------------------------------
-# 4. 多引擎翻譯核心 (MyMemory + Lingva Proxy + Google 備援)
+# 4. 超高穩定度翻譯核心 (Microsoft Edge API)
 # ---------------------------------------------------------
 
-GOOGLE_LANG_MAP = {
-    "ZH": "zh-TW",
-    "EN-US": "en",
-    "JA": "ja",
-    "KO": "ko",
-    "RU": "ru",
-    "ID": "id",
-    "ES": "es",
-    "TH": "th"
+MS_LANG_MAP = {
+    "ZH": "zh-Hant",   # 繁體中文
+    "EN-US": "en",      # 英文
+    "JA": "ja",         # 日文
+    "KO": "ko",         # 韓文
+    "RU": "ru",         # 俄文
+    "ID": "id",         # 印尼文
+    "ES": "es",         # 西班牙文
+    "TH": "th"          # 泰文
 }
+
+async def get_ms_auth_token():
+    """取得 Microsoft Edge 瀏覽器內建翻譯的臨時授權 Token"""
+    auth_url = "https://edge.microsoft.com/translate/auth"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0"
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(auth_url, headers=headers, timeout=5) as resp:
+                if resp.status == 200:
+                    return await resp.text()
+    except Exception as e:
+        print(f"⚠️ 取得微軟授權 Token 失敗: {e}", flush=True)
+    return None
 
 async def translate_text(text, target_lang):
     if not text or not text.strip():
         return text
 
-    tl = GOOGLE_LANG_MAP.get(target_lang, target_lang.lower())
+    tl = MS_LANG_MAP.get(target_lang, target_lang.lower())
+
+    # --- 管道 1：Microsoft Edge 內建翻譯引擎 (防 429 封鎖能力最強) ---
+    token = await get_ms_auth_token()
+    if token:
+        ms_url = f"https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&to={tl}"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0"
+        }
+        body = [{"Text": text}]
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(ms_url, headers=headers, json=body, timeout=8) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        translated = data[0]["translations"][0]["text"]
+                        if translated and translated.strip():
+                            print(f"🈳 [MS Edge API] 翻譯成功 [{target_lang} -> {tl}]: '{text}' ➔ '{translated}'", flush=True)
+                            return translated
+                    print(f"⚠️ [MS Edge API] 回應狀態碼: HTTP {resp.status}，嘗試備援...", flush=True)
+        except Exception as e:
+            print(f"⚠️ [MS Edge API] 連線例外: {e}，嘗試備援...", flush=True)
+
+    # --- 管道 2：Lingva Open Proxy (備援) ---
     encoded_text = urllib.parse.quote(text)
-
-    # --- 管道 1：MyMemory 國際翻譯 API (不受 Render IP 封鎖影響) ---
-    url_mymemory = f"https://api.mymemory.translated.net/get?q={encoded_text}&langpair=autodetect|{tl}"
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url_mymemory, timeout=6) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    translated = data.get("responseData", {}).get("translatedText")
-                    if translated and "MYMEMORY WARNING" not in translated and translated.strip():
-                        print(f"🈳 [MyMemory] 翻譯成功 [{target_lang}]: '{text}' ➔ '{translated}'", flush=True)
-                        return translated
-        print(f"⚠️ [MyMemory] 無法取得結果，切換備援管道...", flush=True)
-    except Exception as e:
-        print(f"⚠️ [MyMemory] 例外: {e}，切換備援管道...", flush=True)
-
-    # --- 管道 2：Lingva Translate (Google 開放代理節點) ---
     url_lingva = f"https://lingva.ml/api/v1/auto/{tl}/{encoded_text}"
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url_lingva, timeout=6) as resp:
+            async with session.get(url_lingva, timeout=8) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     translated = data.get("translation")
                     if translated and translated.strip():
                         print(f"🈳 [Lingva Proxy] 翻譯成功 [{target_lang}]: '{text}' ➔ '{translated}'", flush=True)
                         return translated
-        print(f"⚠️ [Lingva] 無法取得結果，嘗試直連 Google...", flush=True)
     except Exception as e:
-        print(f"⚠️ [Lingva] 例外: {e}，嘗試直連 Google...", flush=True)
+        print(f"⚠️ [Lingva Proxy] 連線例外: {e}", flush=True)
 
-    # --- 管道 3：Google GTX API (備援) ---
-    url_gtx = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl={tl}&dt=t&q={encoded_text}"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url_gtx, headers=headers, timeout=6) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if isinstance(data, list) and len(data) > 0 and data[0]:
-                        translated = "".join(item[0] for item in data[0] if item and item[0])
-                        if translated and translated.strip():
-                            print(f"🈳 [Google GTX] 翻譯成功 [{target_lang}]: '{text}' ➔ '{translated}'", flush=True)
-                            return translated
-                print(f"❌ [Google GTX] 被攔截 (HTTP {resp.status})", flush=True)
-    except Exception as e:
-        print(f"❌ [Google GTX] 例外: {e}", flush=True)
-
+    print(f"❌ 所有翻譯引擎皆無法回應，退回原文發送", flush=True)
     return text
 
 # ---------------------------------------------------------
