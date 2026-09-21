@@ -76,7 +76,7 @@ async def on_ready():
         print(f"⚠️ 同步指令失敗：{e}", flush=True)
 
 # ---------------------------------------------------------
-# 4. 高穩定度翻譯核心 (Chrome API + MyMemory 雙重備援)
+# 4. 超高穩定度翻譯核心 (Android API + GTX + Lingva 代理)
 # ---------------------------------------------------------
 
 GOOGLE_LANG_MAP = {
@@ -97,43 +97,61 @@ async def translate_text(text, target_lang):
     tl = GOOGLE_LANG_MAP.get(target_lang, target_lang.lower())
     encoded_text = urllib.parse.quote(text)
 
-    # --- 方案 1: Chrome 瀏覽器擴充套件專用 Google 接口 (極難被 Render/AWS IP 封鎖) ---
-    url_chrome = f"https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=auto&tl={tl}&q={encoded_text}"
-    headers = {
+    # --- 方案 1：Google Android App 官方端點 (對雲端伺服器 IP 防封鎖能力最強) ---
+    url_android = f"https://translate.googleapis.com/translate_a/single?client=at&sl=auto&tl={tl}&dt=t&q={encoded_text}"
+    headers_android = {
+        "User-Agent": "GoogleTranslate/6.28.0.06.336940608 (Linux; U; Android 10; Pixel 4)"
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url_android, headers=headers_android, timeout=8) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if isinstance(data, list) and len(data) > 0 and data[0]:
+                        translated = "".join(item[0] for item in data[0] if item and item[0])
+                        if translated and translated.strip():
+                            print(f"🈳 [Google Android] 翻譯成功 [{target_lang}]: '{text}' ➔ '{translated}'", flush=True)
+                            return translated
+                print(f"⚠️ [Google Android] HTTP Status: {resp.status}，嘗試備援管道...", flush=True)
+    except Exception as e:
+        print(f"⚠️ [Google Android] 連線例外: {e}，嘗試備援管道...", flush=True)
+
+    # --- 方案 2：Google Web GTX 端點 ---
+    url_gtx = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl={tl}&dt=t&q={encoded_text}"
+    headers_gtx = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
 
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url_chrome, headers=headers, timeout=8) as resp:
+            async with session.get(url_gtx, headers=headers_gtx, timeout=8) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    # Response format: [['翻譯結果', '原文']] or ['翻譯結果']
-                    if isinstance(data, list) and len(data) > 0:
-                        translated = data[0][0] if isinstance(data[0], list) else data[0]
+                    if isinstance(data, list) and len(data) > 0 and data[0]:
+                        translated = "".join(item[0] for item in data[0] if item and item[0])
                         if translated and translated.strip():
-                            print(f"🈳 [Chrome API] 翻譯成功 [{target_lang}]: '{text}' ➔ '{translated}'", flush=True)
+                            print(f"🈳 [Google GTX] 翻譯成功 [{target_lang}]: '{text}' ➔ '{translated}'", flush=True)
                             return translated
-                print(f"⚠️ [Chrome API] 失敗 (HTTP {resp.status})，切換至 MyMemory 備援...", flush=True)
+                print(f"⚠️ [Google GTX] HTTP Status: {resp.status}，嘗試 Lingva 備援...", flush=True)
     except Exception as e:
-        print(f"⚠️ [Chrome API] 連線例外: {e}，切換至 MyMemory 備援...", flush=True)
+        print(f"⚠️ [Google GTX] 連線例外: {e}，嘗試 Lingva 備援...", flush=True)
 
-    # --- 方案 2: MyMemory 國際免費翻譯 API (備援管道) ---
-    url_mymemory = f"https://api.mymemory.translated.net/get?q={encoded_text}&langpair=autodetect|{tl}"
-
+    # --- 方案 3：Lingva Translate (Google 開放代理節點) ---
+    url_lingva = f"https://lingva.ml/api/v1/auto/{tl}/{encoded_text}"
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url_mymemory, timeout=8) as resp:
+            async with session.get(url_lingva, timeout=8) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    translated = data.get("responseData", {}).get("translatedText")
-                    if translated and translated.strip() and translated.upper() != text.upper():
-                        print(f"🈳 [MyMemory] 翻譯成功 [{target_lang}]: '{text}' ➔ '{translated}'", flush=True)
+                    translated = data.get("translation")
+                    if translated and translated.strip():
+                        print(f"🈳 [Lingva Proxy] 翻譯成功 [{target_lang}]: '{text}' ➔ '{translated}'", flush=True)
                         return translated
-                print(f"❌ [MyMemory] 失敗 (HTTP {resp.status})", flush=True)
     except Exception as e:
-        print(f"❌ [MyMemory] 連線例外: {e}", flush=True)
+        print(f"⚠️ [Lingva Proxy] 連線例外: {e}", flush=True)
 
+    print(f"❌ 所有 Google 翻譯引擎均無法回應，退回原文發送", flush=True)
     return text
 
 # ---------------------------------------------------------
