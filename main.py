@@ -5,10 +5,9 @@ import aiohttp
 import asyncio
 import json
 import os
-import threading
-from flask import Flask
+from aiohttp import web
 
-# 嘗試載入本地端的 .env
+# 載入 .env
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -16,30 +15,27 @@ except ImportError:
     pass
 
 # ---------------------------------------------------------
-# 1. Web 保活
+# 1. Web 保活 (aiohttp 原生)
 # ---------------------------------------------------------
 
-app = Flask("")
+async def handle_home(request):
+    return web.Response(text="Bot is alive and running!")
 
-@app.route("/")
-def home():
-    return "Bot is alive and running!"
-
-def run_web():
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", handle_home)
+    runner = web.AppRunner(app)
+    await runner.setup()
     port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
-
-def keep_alive():
-    t = threading.Thread(target=run_web)
-    t.daemon = True
-    t.start()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"🌐 保活伺服器已啟動，Port: {port}", flush=True)
 
 # ---------------------------------------------------------
-# 2. 環境變數與設定
+# 2. 設定檔載入/儲存
 # ---------------------------------------------------------
 
 BOT_TOKEN = os.getenv("DC_BOT_TOKEN")
-DEEPL_API_KEY = os.getenv("DEEPL_API_KEY")
 CONFIG_FILE = "channel_config.json"
 
 def load_config():
@@ -58,7 +54,7 @@ def save_config():
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(CHANNEL_CONFIG, f, indent=4, ensure_ascii=False)
     except Exception as e:
-        print(f"❌ 儲存設定檔失敗: {e}")
+        print(f"❌ 儲存設定檔失敗: {e}", flush=True)
 
 # ---------------------------------------------------------
 # 3. Discord Bot 初始化
@@ -67,89 +63,75 @@ def save_config():
 intents = discord.Intents.default()
 intents.message_content = True
 
-class TranslatorBot(commands.Bot):
-    def __init__(self):
-        super().__init__(command_prefix="!", intents=intents)
-        self.http_session = None
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-    async def setup_hook(self):
-        self.http_session = aiohttp.ClientSession()
-        try:
-            synced = await self.tree.sync()
-            print(f"✅ 已成功同步 {len(synced)} 個斜線指令")
-        except Exception as e:
-            print(f"⚠️ 同步指令失敗：{e}")
-
-    async def close(self):
-        if self.http_session and not self.http_session.closed:
-            await self.http_session.close()
-        await super().close()
-
-bot = TranslatorBot()
+@bot.event
+async def on_ready():
+    print(f"🎉 機器人已成功登入：{bot.user}", flush=True)
+    try:
+        synced = await bot.tree.sync()
+        print(f"✅ 已成功同步 {len(synced)} 個斜線指令", flush=True)
+    except Exception as e:
+        print(f"⚠️ 同步指令失敗：{e}", flush=True)
 
 # ---------------------------------------------------------
-# 4. 翻譯功能
+# 4. Google 翻譯核心功能 (修正語言代碼與 User-Agent)
 # ---------------------------------------------------------
 
-async def translate_text(session, text, target_lang, max_retries=3):
+# Google GTX 專用語言對照表
+GOOGLE_LANG_MAP = {
+    "ZH": "zh-TW",
+    "EN-US": "en",
+    "JA": "ja",
+    "KO": "ko",
+    "RU": "ru",
+    "ID": "id",
+    "ES": "es",
+    "TH": "th"
+}
+
+async def translate_text(text, target_lang):
     if not text or not text.strip():
         return text
 
-    if target_lang == "TH" or not DEEPL_API_KEY:
-        url = "https://translate.googleapis.com/translate_a/single"
-        tl = "th" if target_lang == "TH" else target_lang.lower()
-        params = {
-            "client": "gtx",
-            "sl": "auto",
-            "tl": tl,
-            "dt": "t",
-            "q": text
-        }
+    # 轉換為 Google 支援的語言代碼
+    tl = GOOGLE_LANG_MAP.get(target_lang, target_lang.lower())
 
-        try:
-            async with session.get(url, params=params, timeout=10) as resp:
+    url = "https://translate.googleapis.com/translate_a/single"
+    params = {
+        "client": "gtx",
+        "sl": "auto",
+        "tl": tl,
+        "dt": "t",
+        "q": text
+    }
+    
+    # 偽裝成普通瀏覽器，避免被 Google 回絕 (HTTP 403)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params, headers=headers, timeout=10) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    return "".join(item[0] for item in data[0] if item and item[0])
-                print(f"❌ Google GTX 翻譯失敗: HTTP {resp.status}")
-                return text
-        except Exception as e:
-            print(f"❌ Google GTX 發生錯誤：{e}")
-            return text
-
-    url = "https://api-free.deepl.com/v2/translate" if DEEPL_API_KEY.endswith(":fx") else "https://api.deepl.com/v2/translate"
-    headers = {"Authorization": f"DeepL-Auth-Key {DEEPL_API_KEY}"}
-    data = {"text": [text], "target_lang": target_lang}
-
-    for attempt in range(max_retries):
-        try:
-            async with session.post(url, headers=headers, json=data, timeout=10) as resp:
-                if resp.status == 200:
-                    result = await resp.json()
-                    return result["translations"][0]["text"]
-                elif resp.status == 403:
-                    print("❌ DeepL API Key 無效或額度已滿。")
-                    return text
-                elif resp.status == 429:
-                    await asyncio.sleep((attempt + 1) * 1.5)
-                    continue
+                    translated = "".join(item[0] for item in data[0] if item and item[0])
+                    print(f"🈳 Google 翻譯成功 [{target_lang} -> {tl}]: '{text}' ➔ '{translated}'", flush=True)
+                    return translated
                 else:
-                    print(f"⚠️ DeepL API 錯誤: HTTP {resp.status}")
+                    print(f"❌ Google 翻譯請求失敗: HTTP {resp.status}", flush=True)
                     return text
-        except Exception as e:
-            print(f"⚠️ DeepL 連線異常：{e}")
-            return text
-
-    return text
+    except Exception as e:
+        print(f"❌ Google 翻譯發生錯誤: {e}", flush=True)
+        return text
 
 # ---------------------------------------------------------
-# 5. Webhook 翻譯轉發（含 Debug 輸出）
+# 5. 訊息轉發與 Webhook
 # ---------------------------------------------------------
 
-async def process_and_send(session, message, target_lang, target_cids):
-    print(f"🚀 [DEBUG] 開始翻譯內容至語言 [{target_lang}]...")
-    translated_text = await translate_text(session, message.content, target_lang)
-    print(f"✅ [DEBUG] 翻譯結果：'{translated_text}'")
+async def process_and_send(message, target_lang, target_cids):
+    translated_text = await translate_text(message.content, target_lang)
 
     for cid in target_cids:
         target_channel = bot.get_channel(cid)
@@ -157,7 +139,7 @@ async def process_and_send(session, message, target_lang, target_cids):
             try:
                 target_channel = await bot.fetch_channel(cid)
             except Exception as e:
-                print(f"❌ [DEBUG] 抓取頻道 {cid} 失敗：{e}")
+                print(f"❌ 無法讀取目標頻道 {cid}: {e}", flush=True)
                 continue
 
         try:
@@ -165,7 +147,7 @@ async def process_and_send(session, message, target_lang, target_cids):
             webhook = discord.utils.get(webhooks, name="Translator Webhook")
 
             if webhook is None:
-                print(f"🛠️ [DEBUG] 在頻道 {cid} 建立新的 Webhook...")
+                print(f"🛠️ 正在頻道 {cid} 建立新的 Webhook...", flush=True)
                 webhook = await target_channel.create_webhook(name="Translator Webhook")
 
             await webhook.send(
@@ -174,20 +156,16 @@ async def process_and_send(session, message, target_lang, target_cids):
                 avatar_url=message.author.display_avatar.url,
                 allowed_mentions=discord.AllowedMentions.none()
             )
-            print(f"🎉 [DEBUG] 成功將翻譯轉發至頻道 {cid}")
+            print(f"🎉 成功將翻譯訊息發送至頻道 {cid}！", flush=True)
 
         except discord.Forbidden:
-            print(f"❌ [DEBUG] 權限不足！機器人在頻道 {cid} 沒有「管理 Webhook (Manage Webhooks)」權限！")
+            print(f"❌ 權限錯誤：機器人在頻道 {cid} 缺少「管理 Webhook」權限！", flush=True)
         except Exception as e:
-            print(f"⚠️ [DEBUG] 發送訊息至頻道 {cid} 失敗：{e}")
+            print(f"⚠️ 發送訊息至頻道 {cid} 失敗：{e}", flush=True)
 
 # ---------------------------------------------------------
-# 6. 事件與指令（含 Debug 輸出）
+# 6. 事件監聽與指令
 # ---------------------------------------------------------
-
-@bot.event
-async def on_ready():
-    print(f"🎉 成功連線！機器人名稱：{bot.user}")
 
 @bot.tree.command(name="設定頻道", description="設定翻譯機器人的連動頻道與語言")
 @app_commands.describe(
@@ -213,9 +191,10 @@ async def setup_channel(
     language: app_commands.Choice[str],
     group: str
 ):
+    clean_group = str(group).strip()
     CHANNEL_CONFIG[channel.id] = {
         "lang": language.value,
-        "group": str(group).strip()
+        "group": clean_group
     }
     save_config()
 
@@ -223,7 +202,7 @@ async def setup_channel(
         f"✅ **設定成功！**\n"
         f"📍 **目標頻道**：{channel.mention}\n"
         f"🌐 **輸出語言**：{language.name}\n"
-        f"👥 **所屬群組**：`{str(group).strip()}`"
+        f"👥 **所屬群組**：`{clean_group}`"
     )
     await interaction.response.send_message(success_msg)
 
@@ -244,18 +223,11 @@ async def on_message(message: discord.Message):
     if message.author.bot or message.webhook_id is not None:
         return
 
-    print(f"🔍 [DEBUG] 收到訊息 | 頻道 ID: {message.channel.id} | 內容: '{message.content}'")
-
-    if not message.content.strip():
-        print("⚠️ [DEBUG] 訊息內文為空！請確認 Discord Developer Portal 的 'Message Content Intent' 有開啟！")
-        return
-
     src_channel_id = message.channel.id
 
     if src_channel_id in CHANNEL_CONFIG:
         src_info = CHANNEL_CONFIG[src_channel_id]
         current_group = str(src_info["group"]).strip()
-        print(f"🔍 [DEBUG] 發言頻道位在群組：'{current_group}'")
 
         lang_to_channels = {}
 
@@ -267,18 +239,12 @@ async def on_message(message: discord.Message):
                     lang_to_channels[lang] = []
                 lang_to_channels[lang].append(cid)
 
-        print(f"🔍 [DEBUG] 找到同群組的其他目標頻道：{lang_to_channels}")
-
-        if lang_to_channels and bot.http_session:
+        if lang_to_channels:
             async with message.channel.typing():
                 tasks = []
                 for lang, target_cids in lang_to_channels.items():
-                    tasks.append(
-                        process_and_send(bot.http_session, message, lang, target_cids)
-                    )
+                    tasks.append(process_and_send(message, lang, target_cids))
                 await asyncio.gather(*tasks)
-    else:
-        print(f"⚠️ [DEBUG] 頻道 {src_channel_id} 尚未加入設定。當前所有設定檔：{CHANNEL_CONFIG}")
 
     await bot.process_commands(message)
 
@@ -287,28 +253,28 @@ async def on_message(message: discord.Message):
 # ---------------------------------------------------------
 
 async def main():
-    keep_alive()
+    await start_web_server()
 
     if not BOT_TOKEN:
-        print("❌ 錯誤：找不到 DC_BOT_TOKEN 環境變數！")
+        print("❌ 錯誤：找不到 DC_BOT_TOKEN 環境變數！", flush=True)
         return
 
     while True:
         try:
-            print("🚀 嘗試連線至 Discord...")
+            print("🚀 嘗試連線至 Discord...", flush=True)
             async with bot:
                 await bot.start(BOT_TOKEN)
 
         except discord.errors.HTTPException as e:
             if e.status == 429:
-                print("⚠️ Discord 429 限制，60 秒後重試...")
+                print("⚠️ Discord 429 限制，60 秒後重試...", flush=True)
                 await asyncio.sleep(60)
             else:
-                print(f"❌ 連線異常 ({e.status})，10 秒後重試...")
+                print(f"❌ 連線異常 ({e.status})，10 秒後重試...", flush=True)
                 await asyncio.sleep(10)
 
         except Exception as e:
-            print(f"❌ 發生錯誤 ({e})，10 秒後重試...")
+            print(f"❌ 發生錯誤 ({e})，10 秒後重試...", flush=True)
             await asyncio.sleep(10)
 
 if __name__ == "__main__":
