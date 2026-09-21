@@ -61,11 +61,11 @@ def save_config():
         print(f"❌ 儲存設定檔失敗: {e}")
 
 # ---------------------------------------------------------
-# 3. Discord Bot 初始化（使用類別封裝 lifecycle）
+# 3. Discord Bot 初始化
 # ---------------------------------------------------------
 
 intents = discord.Intents.default()
-intents.message_content = True  # 注意：請確認 Developer Portal 已勾選 Message Content Intent
+intents.message_content = True
 
 class TranslatorBot(commands.Bot):
     def __init__(self):
@@ -73,10 +73,7 @@ class TranslatorBot(commands.Bot):
         self.http_session = None
 
     async def setup_hook(self):
-        # 建立共用的 aiohttp Session
         self.http_session = aiohttp.ClientSession()
-        
-        # 同步斜線指令
         try:
             synced = await self.tree.sync()
             print(f"✅ 已成功同步 {len(synced)} 個斜線指令")
@@ -98,7 +95,6 @@ async def translate_text(session, text, target_lang, max_retries=3):
     if not text or not text.strip():
         return text
 
-    # 泰文或沒有 DeepL Key 時走 Google GTX
     if target_lang == "TH" or not DEEPL_API_KEY:
         url = "https://translate.googleapis.com/translate_a/single"
         tl = "th" if target_lang == "TH" else target_lang.lower()
@@ -115,15 +111,12 @@ async def translate_text(session, text, target_lang, max_retries=3):
                 if resp.status == 200:
                     data = await resp.json()
                     return "".join(item[0] for item in data[0] if item and item[0])
-
                 print(f"❌ Google GTX 翻譯失敗: HTTP {resp.status}")
                 return text
-
         except Exception as e:
             print(f"❌ Google GTX 發生錯誤：{e}")
             return text
 
-    # DeepL API
     url = "https://api-free.deepl.com/v2/translate" if DEEPL_API_KEY.endswith(":fx") else "https://api.deepl.com/v2/translate"
     headers = {"Authorization": f"DeepL-Auth-Key {DEEPL_API_KEY}"}
     data = {"text": [text], "target_lang": target_lang}
@@ -143,7 +136,6 @@ async def translate_text(session, text, target_lang, max_retries=3):
                 else:
                     print(f"⚠️ DeepL API 錯誤: HTTP {resp.status}")
                     return text
-
         except Exception as e:
             print(f"⚠️ DeepL 連線異常：{e}")
             return text
@@ -151,20 +143,21 @@ async def translate_text(session, text, target_lang, max_retries=3):
     return text
 
 # ---------------------------------------------------------
-# 5. Webhook 翻譯轉發
+# 5. Webhook 翻譯轉發（含 Debug 輸出）
 # ---------------------------------------------------------
 
 async def process_and_send(session, message, target_lang, target_cids):
+    print(f"🚀 [DEBUG] 開始翻譯內容至語言 [{target_lang}]...")
     translated_text = await translate_text(session, message.content, target_lang)
+    print(f"✅ [DEBUG] 翻譯結果：'{translated_text}'")
 
     for cid in target_cids:
-        # 修復重點：先嘗試獲取快取，若快取無資料則從 Discord API 撈取
         target_channel = bot.get_channel(cid)
         if not target_channel:
             try:
                 target_channel = await bot.fetch_channel(cid)
             except Exception as e:
-                print(f"❌ 找不到或無法存取頻道 {cid}：{e}")
+                print(f"❌ [DEBUG] 抓取頻道 {cid} 失敗：{e}")
                 continue
 
         try:
@@ -172,6 +165,7 @@ async def process_and_send(session, message, target_lang, target_cids):
             webhook = discord.utils.get(webhooks, name="Translator Webhook")
 
             if webhook is None:
+                print(f"🛠️ [DEBUG] 在頻道 {cid} 建立新的 Webhook...")
                 webhook = await target_channel.create_webhook(name="Translator Webhook")
 
             await webhook.send(
@@ -180,14 +174,15 @@ async def process_and_send(session, message, target_lang, target_cids):
                 avatar_url=message.author.display_avatar.url,
                 allowed_mentions=discord.AllowedMentions.none()
             )
+            print(f"🎉 [DEBUG] 成功將翻譯轉發至頻道 {cid}")
 
         except discord.Forbidden:
-            print(f"❌ 頻道 {cid} 無法使用 Webhook，請確認 Bot 有「管理 Webhook」權限。")
+            print(f"❌ [DEBUG] 權限不足！機器人在頻道 {cid} 沒有「管理 Webhook (Manage Webhooks)」權限！")
         except Exception as e:
-            print(f"⚠️ 無法發送訊息至頻道 {cid}：{e}")
+            print(f"⚠️ [DEBUG] 發送訊息至頻道 {cid} 失敗：{e}")
 
 # ---------------------------------------------------------
-# 6. 事件監聽與指令
+# 6. 事件與指令（含 Debug 輸出）
 # ---------------------------------------------------------
 
 @bot.event
@@ -220,7 +215,7 @@ async def setup_channel(
 ):
     CHANNEL_CONFIG[channel.id] = {
         "lang": language.value,
-        "group": group
+        "group": str(group).strip()
     }
     save_config()
 
@@ -228,7 +223,7 @@ async def setup_channel(
         f"✅ **設定成功！**\n"
         f"📍 **目標頻道**：{channel.mention}\n"
         f"🌐 **輸出語言**：{language.name}\n"
-        f"👥 **所屬群組**：`{group}`"
+        f"👥 **所屬群組**：`{str(group).strip()}`"
     )
     await interaction.response.send_message(success_msg)
 
@@ -246,24 +241,33 @@ async def check_config(interaction: discord.Interaction):
 
 @bot.event
 async def on_message(message: discord.Message):
-    # 忽略 Bot / Webhook / 空訊息
-    if message.author.bot or message.webhook_id is not None or not message.content.strip():
+    if message.author.bot or message.webhook_id is not None:
+        return
+
+    print(f"🔍 [DEBUG] 收到訊息 | 頻道 ID: {message.channel.id} | 內容: '{message.content}'")
+
+    if not message.content.strip():
+        print("⚠️ [DEBUG] 訊息內文為空！請確認 Discord Developer Portal 的 'Message Content Intent' 有開啟！")
         return
 
     src_channel_id = message.channel.id
 
     if src_channel_id in CHANNEL_CONFIG:
         src_info = CHANNEL_CONFIG[src_channel_id]
-        current_group = src_info["group"]
+        current_group = str(src_info["group"]).strip()
+        print(f"🔍 [DEBUG] 發言頻道位在群組：'{current_group}'")
 
         lang_to_channels = {}
 
         for cid, config in CHANNEL_CONFIG.items():
-            if config["group"] == current_group and cid != src_channel_id:
+            cfg_group = str(config["group"]).strip()
+            if cfg_group == current_group and cid != src_channel_id:
                 lang = config["lang"]
                 if lang not in lang_to_channels:
                     lang_to_channels[lang] = []
                 lang_to_channels[lang].append(cid)
+
+        print(f"🔍 [DEBUG] 找到同群組的其他目標頻道：{lang_to_channels}")
 
         if lang_to_channels and bot.http_session:
             async with message.channel.typing():
@@ -273,6 +277,8 @@ async def on_message(message: discord.Message):
                         process_and_send(bot.http_session, message, lang, target_cids)
                     )
                 await asyncio.gather(*tasks)
+    else:
+        print(f"⚠️ [DEBUG] 頻道 {src_channel_id} 尚未加入設定。當前所有設定檔：{CHANNEL_CONFIG}")
 
     await bot.process_commands(message)
 
