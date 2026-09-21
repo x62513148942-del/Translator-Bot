@@ -5,7 +5,6 @@ import aiohttp
 import asyncio
 import json
 import os
-import urllib.parse
 from aiohttp import web
 
 # 載入 .env
@@ -69,6 +68,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 @bot.event
 async def on_ready():
     print(f"🎉 機器人已成功登入：{bot.user}", flush=True)
+    print(f"🟢 翻譯引擎已切換為：微軟 Edge 官方 API (防封鎖最終版)", flush=True)
     try:
         synced = await bot.tree.sync()
         print(f"✅ 已成功同步 {len(synced)} 個斜線指令", flush=True)
@@ -76,81 +76,67 @@ async def on_ready():
         print(f"⚠️ 同步指令失敗：{e}", flush=True)
 
 # ---------------------------------------------------------
-# 4. 超高穩定度翻譯核心 (Microsoft Edge API)
+# 4. 微軟 Edge 授權翻譯核心 (徹底繞過 429 限制)
 # ---------------------------------------------------------
 
+# 微軟專用語系代碼對照表
 MS_LANG_MAP = {
     "ZH": "zh-Hant",   # 繁體中文
-    "EN-US": "en",      # 英文
-    "JA": "ja",         # 日文
-    "KO": "ko",         # 韓文
-    "RU": "ru",         # 俄文
-    "ID": "id",         # 印尼文
-    "ES": "es",         # 西班牙文
-    "TH": "th"          # 泰文
+    "EN-US": "en",     # 英文
+    "JA": "ja",        # 日文
+    "KO": "ko",        # 韓文
+    "RU": "ru",        # 俄文
+    "ID": "id",        # 印尼文
+    "ES": "es",        # 西班牙文
+    "TH": "th"         # 泰文
 }
-
-async def get_ms_auth_token():
-    """取得 Microsoft Edge 瀏覽器內建翻譯的臨時授權 Token"""
-    auth_url = "https://edge.microsoft.com/translate/auth"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0"
-    }
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(auth_url, headers=headers, timeout=5) as resp:
-                if resp.status == 200:
-                    return await resp.text()
-    except Exception as e:
-        print(f"⚠️ 取得微軟授權 Token 失敗: {e}", flush=True)
-    return None
 
 async def translate_text(text, target_lang):
     if not text or not text.strip():
         return text
 
     tl = MS_LANG_MAP.get(target_lang, target_lang.lower())
-
-    # --- 管道 1：Microsoft Edge 內建翻譯引擎 (防 429 封鎖能力最強) ---
-    token = await get_ms_auth_token()
-    if token:
-        ms_url = f"https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&to={tl}"
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0"
-        }
-        body = [{"Text": text}]
-
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(ms_url, headers=headers, json=body, timeout=8) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        translated = data[0]["translations"][0]["text"]
-                        if translated and translated.strip():
-                            print(f"🈳 [MS Edge API] 翻譯成功 [{target_lang} -> {tl}]: '{text}' ➔ '{translated}'", flush=True)
-                            return translated
-                    print(f"⚠️ [MS Edge API] 回應狀態碼: HTTP {resp.status}，嘗試備援...", flush=True)
-        except Exception as e:
-            print(f"⚠️ [MS Edge API] 連線例外: {e}，嘗試備援...", flush=True)
-
-    # --- 管道 2：Lingva Open Proxy (備援) ---
-    encoded_text = urllib.parse.quote(text)
-    url_lingva = f"https://lingva.ml/api/v1/auto/{tl}/{encoded_text}"
+    
+    # 步驟 1：向微軟伺服器索取合法通行證 (Token)
+    auth_url = "https://edge.microsoft.com/translate/auth"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.0.0"
+    }
+    
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url_lingva, timeout=8) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    translated = data.get("translation")
-                    if translated and translated.strip():
-                        print(f"🈳 [Lingva Proxy] 翻譯成功 [{target_lang}]: '{text}' ➔ '{translated}'", flush=True)
-                        return translated
-    except Exception as e:
-        print(f"⚠️ [Lingva Proxy] 連線例外: {e}", flush=True)
+            # 取得 Token
+            async with session.get(auth_url, headers=headers, timeout=5) as auth_resp:
+                if auth_resp.status == 200:
+                    raw_token = await auth_resp.text()
+                    token = raw_token.strip(' "') # 確保移除多餘引號
+                else:
+                    print(f"❌ [獲取 Token 失敗] HTTP {auth_resp.status}", flush=True)
+                    return text
 
-    print(f"❌ 所有翻譯引擎皆無法回應，退回原文發送", flush=True)
+            # 步驟 2：帶入 Token 進行合法翻譯請求
+            if token:
+                api_url = f"https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&to={tl}"
+                api_headers = {
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                    "User-Agent": headers["User-Agent"]
+                }
+                body = [{"Text": text}]
+                
+                async with session.post(api_url, headers=api_headers, json=body, timeout=8) as trans_resp:
+                    if trans_resp.status == 200:
+                        data = await trans_resp.json()
+                        translated = data[0]["translations"][0]["text"]
+                        print(f"🈳 [微軟 Edge 翻譯成功]: '{text}' ➔ '{translated}'", flush=True)
+                        return translated
+                    else:
+                        error_msg = await trans_resp.text()
+                        print(f"❌ [翻譯請求被拒絕] HTTP {trans_resp.status}: {error_msg}", flush=True)
+
+    except Exception as e:
+        print(f"⚠️ 翻譯模組發生嚴重錯誤: {e}", flush=True)
+        
     return text
 
 # ---------------------------------------------------------
@@ -174,7 +160,6 @@ async def process_and_send(message, target_lang, target_cids):
             webhook = discord.utils.get(webhooks, name="Translator Webhook")
 
             if webhook is None:
-                print(f"🛠️ 正在頻道 {cid} 建立新的 Webhook...", flush=True)
                 webhook = await target_channel.create_webhook(name="Translator Webhook")
 
             await webhook.send(
@@ -183,7 +168,7 @@ async def process_and_send(message, target_lang, target_cids):
                 avatar_url=message.author.display_avatar.url,
                 allowed_mentions=discord.AllowedMentions.none()
             )
-            print(f"🎉 成功將翻譯訊息發送至頻道 {cid}！", flush=True)
+            print(f"🎉 成功將翻譯訊息轉發至頻道 {cid}！", flush=True)
 
         except discord.Forbidden:
             print(f"❌ 權限錯誤：機器人在頻道 {cid} 缺少「管理 Webhook」權限！", flush=True)
