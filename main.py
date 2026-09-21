@@ -5,6 +5,8 @@ import aiohttp
 import asyncio
 import json
 import os
+import urllib.parse
+import random
 from aiohttp import web
 
 # 載入 .env
@@ -68,7 +70,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 @bot.event
 async def on_ready():
     print(f"🎉 機器人已成功登入：{bot.user}", flush=True)
-    print(f"🟢 翻譯引擎已切換為：微軟 Edge 官方 API (防封鎖最終版)", flush=True)
+    print(f"🟢 翻譯引擎已切換為：三引擎輪替 + 動態 IP 偽裝 (穩定版)", flush=True)
     try:
         synced = await bot.tree.sync()
         print(f"✅ 已成功同步 {len(synced)} 個斜線指令", flush=True)
@@ -76,67 +78,78 @@ async def on_ready():
         print(f"⚠️ 同步指令失敗：{e}", flush=True)
 
 # ---------------------------------------------------------
-# 4. 微軟 Edge 授權翻譯核心 (徹底繞過 429 限制)
+# 4. 三引擎輪替翻譯核心 (抗封鎖機制)
 # ---------------------------------------------------------
 
-# 微軟專用語系代碼對照表
-MS_LANG_MAP = {
-    "ZH": "zh-Hant",   # 繁體中文
-    "EN-US": "en",     # 英文
-    "JA": "ja",        # 日文
-    "KO": "ko",        # 韓文
-    "RU": "ru",        # 俄文
-    "ID": "id",        # 印尼文
-    "ES": "es",        # 西班牙文
-    "TH": "th"         # 泰文
+# 統一語言代碼
+GL_MAP = {
+    "ZH": "zh-TW",
+    "EN-US": "en",
+    "JA": "ja",
+    "KO": "ko",
+    "RU": "ru",
+    "ID": "id",
+    "ES": "es",
+    "TH": "th"
 }
 
 async def translate_text(text, target_lang):
     if not text or not text.strip():
         return text
 
-    tl = MS_LANG_MAP.get(target_lang, target_lang.lower())
-    
-    # 步驟 1：向微軟伺服器索取合法通行證 (Token)
-    auth_url = "https://edge.microsoft.com/translate/auth"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.0.0"
+    tl = GL_MAP.get(target_lang, target_lang.lower())
+    encoded_text = urllib.parse.quote(text)
+
+    # 產生隨機虛假 IP 來欺騙 Google 防火牆 (繞過 429 限制)
+    fake_ip = f"{random.randint(1, 255)}.{random.randint(0, 255)}.{random.randint(0, 255)}.{random.randint(1, 255)}"
+    fake_headers = {
+        "User-Agent": f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{random.randint(110, 125)}.0.0.0 Safari/537.36",
+        "X-Forwarded-For": fake_ip,
+        "X-Real-IP": fake_ip
     }
-    
-    try:
-        async with aiohttp.ClientSession() as session:
-            # 取得 Token
-            async with session.get(auth_url, headers=headers, timeout=5) as auth_resp:
-                if auth_resp.status == 200:
-                    raw_token = await auth_resp.text()
-                    token = raw_token.strip(' "') # 確保移除多餘引號
-                else:
-                    print(f"❌ [獲取 Token 失敗] HTTP {auth_resp.status}", flush=True)
-                    return text
 
-            # 步驟 2：帶入 Token 進行合法翻譯請求
-            if token:
-                api_url = f"https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&to={tl}"
-                api_headers = {
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/json",
-                    "User-Agent": headers["User-Agent"]
-                }
-                body = [{"Text": text}]
-                
-                async with session.post(api_url, headers=api_headers, json=body, timeout=8) as trans_resp:
-                    if trans_resp.status == 200:
-                        data = await trans_resp.json()
-                        translated = data[0]["translations"][0]["text"]
-                        print(f"🈳 [微軟 Edge 翻譯成功]: '{text}' ➔ '{translated}'", flush=True)
+    async with aiohttp.ClientSession() as session:
+        # --- 引擎 1：PopCat API (機器人專用，穩定度最高) ---
+        try:
+            url_popcat = f"https://api.popcat.xyz/translate?to={tl}&text={encoded_text}"
+            async with session.get(url_popcat, timeout=5) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    translated = data.get("translated")
+                    if translated and translated.strip():
+                        print(f"🈳 [PopCat API 成功]: '{text}' ➔ '{translated}'", flush=True)
                         return translated
-                    else:
-                        error_msg = await trans_resp.text()
-                        print(f"❌ [翻譯請求被拒絕] HTTP {trans_resp.status}: {error_msg}", flush=True)
+        except Exception as e:
+            print(f"⚠️ [PopCat API 失敗]: {e}，自動切換引擎...", flush=True)
 
-    except Exception as e:
-        print(f"⚠️ 翻譯模組發生嚴重錯誤: {e}", flush=True)
-        
+        # --- 引擎 2：Google GTX (動態 IP 偽裝) ---
+        try:
+            url_google = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl={tl}&dt=t&q={encoded_text}"
+            async with session.get(url_google, headers=fake_headers, timeout=5) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    translated = "".join(item[0] for item in data[0] if item and item[0])
+                    if translated and translated.strip():
+                        print(f"🈳 [Google GTX 成功]: '{text}' ➔ '{translated}'", flush=True)
+                        return translated
+        except Exception as e:
+            print(f"⚠️ [Google GTX 失敗]: {e}，自動切換引擎...", flush=True)
+
+        # --- 引擎 3：MyMemory (動態信箱提權，每天解鎖 5000 額度) ---
+        try:
+            random_email = f"bot_{random.randint(10000, 99999)}@gmail.com"
+            url_mymemory = f"https://api.mymemory.translated.net/get?q={encoded_text}&langpair=autodetect|{tl}&de={random_email}"
+            async with session.get(url_mymemory, timeout=5) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    translated = data.get("responseData", {}).get("translatedText")
+                    if translated and "MYMEMORY WARNING" not in translated and translated.strip():
+                        print(f"🈳 [MyMemory 成功]: '{text}' ➔ '{translated}'", flush=True)
+                        return translated
+        except Exception as e:
+            print(f"⚠️ [MyMemory 失敗]: {e}", flush=True)
+
+    print(f"❌ 所有翻譯引擎皆無法連線，退回原文", flush=True)
     return text
 
 # ---------------------------------------------------------
