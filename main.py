@@ -66,16 +66,21 @@ intents = discord.Intents.default()
 intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
+synced_once = False  # 防止斷線重連時重複 sync 引發 429
 
 @bot.event
 async def on_ready():
+    global synced_once
     print(f"🎉 機器人已成功登入：{bot.user}", flush=True)
     print(f"🟢 翻譯引擎已切換為：三引擎輪替 + 動態 IP 偽裝 (穩定版)", flush=True)
-    try:
-        synced = await bot.tree.sync()
-        print(f"✅ 已成功同步 {len(synced)} 個斜線指令", flush=True)
-    except Exception as e:
-        print(f"⚠️ 同步指令失敗：{e}", flush=True)
+    
+    if not synced_once:
+        try:
+            synced = await bot.tree.sync()
+            print(f"✅ 已成功同步 {len(synced)} 個斜線指令", flush=True)
+            synced_once = True
+        except Exception as e:
+            print(f"⚠️ 同步指令失敗：{e}", flush=True)
 
 # ---------------------------------------------------------
 # 4. 三引擎輪替翻譯核心 (抗封鎖機制)
@@ -156,37 +161,49 @@ async def translate_text(text, target_lang):
 # 5. 訊息轉發與 Webhook
 # ---------------------------------------------------------
 
+# 併發訊號量限制，避免同時發送過多 Webhook 觸發速率限制
+webhook_semaphore = asyncio.Semaphore(3)
+
 async def process_and_send(message, target_lang, target_cids):
     translated_text = await translate_text(message.content, target_lang)
 
     for cid in target_cids:
-        target_channel = bot.get_channel(cid)
-        if not target_channel:
+        async with webhook_semaphore:
+            target_channel = bot.get_channel(cid)
+            if not target_channel:
+                try:
+                    target_channel = await bot.fetch_channel(cid)
+                except Exception as e:
+                    print(f"❌ 無法讀取目標頻道 {cid}: {e}", flush=True)
+                    continue
+
             try:
-                target_channel = await bot.fetch_channel(cid)
+                webhooks = await target_channel.webhooks()
+                webhook = discord.utils.get(webhooks, name="Translator Webhook")
+
+                if webhook is None:
+                    webhook = await target_channel.create_webhook(name="Translator Webhook")
+
+                await webhook.send(
+                    content=translated_text,
+                    username=message.author.display_name,
+                    avatar_url=message.author.display_avatar.url,
+                    allowed_mentions=discord.AllowedMentions.none()
+                )
+                print(f"🎉 成功將翻譯訊息轉發至頻道 {cid}！", flush=True)
+                
+                # 每次發送後微小休眠，降低觸發 Discord Webhook 限流風險
+                await asyncio.sleep(0.3)
+
+            except discord.HTTPException as e:
+                if e.status == 429:
+                    print(f"⚠️ 頻道 {cid} 發送 Webhook 觸發限流(429)，將暫緩發送", flush=True)
+                else:
+                    print(f"⚠️ 發送訊息至頻道 {cid} 失敗：{e}", flush=True)
+            except discord.Forbidden:
+                print(f"❌ 權限錯誤：機器人在頻道 {cid} 缺少「管理 Webhook」權限！", flush=True)
             except Exception as e:
-                print(f"❌ 無法讀取目標頻道 {cid}: {e}", flush=True)
-                continue
-
-        try:
-            webhooks = await target_channel.webhooks()
-            webhook = discord.utils.get(webhooks, name="Translator Webhook")
-
-            if webhook is None:
-                webhook = await target_channel.create_webhook(name="Translator Webhook")
-
-            await webhook.send(
-                content=translated_text,
-                username=message.author.display_name,
-                avatar_url=message.author.display_avatar.url,
-                allowed_mentions=discord.AllowedMentions.none()
-            )
-            print(f"🎉 成功將翻譯訊息轉發至頻道 {cid}！", flush=True)
-
-        except discord.Forbidden:
-            print(f"❌ 權限錯誤：機器人在頻道 {cid} 缺少「管理 Webhook」權限！", flush=True)
-        except Exception as e:
-            print(f"⚠️ 發送訊息至頻道 {cid} 失敗：{e}", flush=True)
+                print(f"⚠️ 發送訊息至頻道 {cid} 失敗：{e}", flush=True)
 
 # ---------------------------------------------------------
 # 6. 事件監聽與指令
@@ -284,16 +301,21 @@ async def main():
         print("❌ 錯誤：找不到 DC_BOT_TOKEN 環境變數！", flush=True)
         return
 
+    retry_delay = 60  # 初始重試等待秒數
+
     while True:
         try:
             print("🚀 嘗試連線至 Discord...", flush=True)
             async with bot:
                 await bot.start(BOT_TOKEN)
+            retry_delay = 60  # 連線順利關閉後重置等待時間
 
         except discord.errors.HTTPException as e:
             if e.status == 429:
-                print("⚠️ Discord 429 限制，60 秒後重試...", flush=True)
-                await asyncio.sleep(60)
+                print(f"⚠️ Discord 429 限制，{retry_delay} 秒後重試...", flush=True)
+                await asyncio.sleep(retry_delay)
+                # 指數退避：重試間隔翻倍，最高 10 分鐘，避免連續請求被 Discrd 封鎖 IP
+                retry_delay = min(retry_delay * 2, 600)
             else:
                 print(f"❌ 連線異常 ({e.status})，10 秒後重試...", flush=True)
                 await asyncio.sleep(10)
