@@ -59,34 +59,117 @@ def save_config():
         print(f"❌ 儲存設定檔失敗: {e}", flush=True)
 
 # ---------------------------------------------------------
-# 3. Discord Bot 初始化
+# 3. 建立 Bot 實例的工廠函式 (防止 Session is Closed 錯誤)
 # ---------------------------------------------------------
 
-intents = discord.Intents.default()
-intents.message_content = True
+synced_once = False  # 防止重複 sync 引發 429
 
-bot = commands.Bot(command_prefix="!", intents=intents)
-synced_once = False  # 防止斷線重連時重複 sync 引發 429
+def create_bot():
+    intents = discord.Intents.default()
+    intents.message_content = True
+    bot = commands.Bot(command_prefix="!", intents=intents)
 
-@bot.event
-async def on_ready():
-    global synced_once
-    print(f"🎉 機器人已成功登入：{bot.user}", flush=True)
-    print(f"🟢 翻譯引擎已切換為：三引擎輪替 + 動態 IP 偽裝 (穩定版)", flush=True)
-    
-    if not synced_once:
-        try:
-            synced = await bot.tree.sync()
-            print(f"✅ 已成功同步 {len(synced)} 個斜線指令", flush=True)
-            synced_once = True
-        except Exception as e:
-            print(f"⚠️ 同步指令失敗：{e}", flush=True)
+    @bot.event
+    async def on_ready():
+        global synced_once
+        print(f"🎉 機器人已成功登入：{bot.user}", flush=True)
+        print(f"🟢 翻譯引擎已切換為：三引擎輪替 + 動態 IP 偽裝 (穩定版)", flush=True)
+        
+        if not synced_once:
+            try:
+                synced = await bot.tree.sync()
+                print(f"✅ 已成功同步 {len(synced)} 個斜線指令", flush=True)
+                synced_once = True
+            except Exception as e:
+                print(f"⚠️ 同步指令失敗：{e}", flush=True)
+
+    @bot.tree.command(name="設定頻道", description="設定翻譯機器人的連動頻道與語言")
+    @app_commands.describe(
+        channel="請選擇要綁定的頻道",
+        language="請選擇翻譯輸出的語言",
+        group="請輸入群組名稱"
+    )
+    @app_commands.choices(
+        language=[
+            app_commands.Choice(name="中文", value="ZH"),
+            app_commands.Choice(name="英文 (美式)", value="EN-US"),
+            app_commands.Choice(name="日文", value="JA"),
+            app_commands.Choice(name="韓文", value="KO"),
+            app_commands.Choice(name="俄文", value="RU"),
+            app_commands.Choice(name="印尼文", value="ID"),
+            app_commands.Choice(name="西班牙文", value="ES"),
+            app_commands.Choice(name="泰文", value="TH"),
+        ]
+    )
+    async def setup_channel(
+        interaction: discord.Interaction,
+        channel: discord.TextChannel,
+        language: app_commands.Choice[str],
+        group: str
+    ):
+        clean_group = str(group).strip()
+        CHANNEL_CONFIG[channel.id] = {
+            "lang": language.value,
+            "group": clean_group
+        }
+        save_config()
+
+        success_msg = (
+            f"✅ **設定成功！**\n"
+            f"📍 **目標頻道**：{channel.mention}\n"
+            f"🌐 **輸出語言**：{language.name}\n"
+            f"👥 **所屬群組**：`{clean_group}`"
+        )
+        await interaction.response.send_message(success_msg)
+
+    @bot.tree.command(name="查詢設定", description="查看目前所有頻道的翻譯設定")
+    async def check_config(interaction: discord.Interaction):
+        if not CHANNEL_CONFIG:
+            await interaction.response.send_message("目前沒有任何頻道設定喔！", ephemeral=True)
+            return
+
+        msg = "**當前翻譯頻道設定清單：**\n"
+        for cid, data in CHANNEL_CONFIG.items():
+            msg += f"<#{cid}> ➔ 群組: `{data['group']}` | 語言: `{data['lang']}`\n"
+
+        await interaction.response.send_message(msg, ephemeral=True)
+
+    @bot.event
+    async def on_message(message: discord.Message):
+        if message.author.bot or message.webhook_id is not None:
+            return
+
+        src_channel_id = message.channel.id
+
+        if src_channel_id in CHANNEL_CONFIG:
+            src_info = CHANNEL_CONFIG[src_channel_id]
+            current_group = str(src_info["group"]).strip()
+
+            lang_to_channels = {}
+
+            for cid, config in CHANNEL_CONFIG.items():
+                cfg_group = str(config["group"]).strip()
+                if cfg_group == current_group and cid != src_channel_id:
+                    lang = config["lang"]
+                    if lang not in lang_to_channels:
+                        lang_to_channels[lang] = []
+                    lang_to_channels[lang].append(cid)
+
+            if lang_to_channels:
+                async with message.channel.typing():
+                    tasks = []
+                    for lang, target_cids in lang_to_channels.items():
+                        tasks.append(process_and_send(bot, message, lang, target_cids))
+                    await asyncio.gather(*tasks)
+
+        await bot.process_commands(message)
+
+    return bot
 
 # ---------------------------------------------------------
 # 4. 三引擎輪替翻譯核心 (抗封鎖機制)
 # ---------------------------------------------------------
 
-# 統一語言代碼
 GL_MAP = {
     "ZH": "zh-TW",
     "EN-US": "en",
@@ -105,7 +188,6 @@ async def translate_text(text, target_lang):
     tl = GL_MAP.get(target_lang, target_lang.lower())
     encoded_text = urllib.parse.quote(text)
 
-    # 產生隨機虛假 IP 來欺騙 Google 防火牆 (繞過 429 限制)
     fake_ip = f"{random.randint(1, 255)}.{random.randint(0, 255)}.{random.randint(0, 255)}.{random.randint(1, 255)}"
     fake_headers = {
         "User-Agent": f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{random.randint(110, 125)}.0.0.0 Safari/537.36",
@@ -114,7 +196,7 @@ async def translate_text(text, target_lang):
     }
 
     async with aiohttp.ClientSession() as session:
-        # --- 引擎 1：PopCat API (機器人專用，穩定度最高) ---
+        # --- 引擎 1：PopCat API ---
         try:
             url_popcat = f"https://api.popcat.xyz/translate?to={tl}&text={encoded_text}"
             async with session.get(url_popcat, timeout=5) as resp:
@@ -127,7 +209,7 @@ async def translate_text(text, target_lang):
         except Exception as e:
             print(f"⚠️ [PopCat API 失敗]: {e}，自動切換引擎...", flush=True)
 
-        # --- 引擎 2：Google GTX (動態 IP 偽裝) ---
+        # --- 引擎 2：Google GTX ---
         try:
             url_google = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl={tl}&dt=t&q={encoded_text}"
             async with session.get(url_google, headers=fake_headers, timeout=5) as resp:
@@ -140,7 +222,7 @@ async def translate_text(text, target_lang):
         except Exception as e:
             print(f"⚠️ [Google GTX 失敗]: {e}，自動切換引擎...", flush=True)
 
-        # --- 引擎 3：MyMemory (動態信箱提權，每天解鎖 5000 額度) ---
+        # --- 引擎 3：MyMemory ---
         try:
             random_email = f"bot_{random.randint(10000, 99999)}@gmail.com"
             url_mymemory = f"https://api.mymemory.translated.net/get?q={encoded_text}&langpair=autodetect|{tl}&de={random_email}"
@@ -161,10 +243,9 @@ async def translate_text(text, target_lang):
 # 5. 訊息轉發與 Webhook
 # ---------------------------------------------------------
 
-# 併發訊號量限制，避免同時發送過多 Webhook 觸發速率限制
 webhook_semaphore = asyncio.Semaphore(3)
 
-async def process_and_send(message, target_lang, target_cids):
+async def process_and_send(bot, message, target_lang, target_cids):
     translated_text = await translate_text(message.content, target_lang)
 
     for cid in target_cids:
@@ -191,13 +272,11 @@ async def process_and_send(message, target_lang, target_cids):
                     allowed_mentions=discord.AllowedMentions.none()
                 )
                 print(f"🎉 成功將翻譯訊息轉發至頻道 {cid}！", flush=True)
-                
-                # 每次發送後微小休眠，降低觸發 Discord Webhook 限流風險
                 await asyncio.sleep(0.3)
 
             except discord.HTTPException as e:
                 if e.status == 429:
-                    print(f"⚠️ 頻道 {cid} 發送 Webhook 觸發限流(429)，將暫緩發送", flush=True)
+                    print(f"⚠️ 頻道 {cid} 發送 Webhook 觸發限流(429)，暫緩發送", flush=True)
                 else:
                     print(f"⚠️ 發送訊息至頻道 {cid} 失敗：{e}", flush=True)
             except discord.Forbidden:
@@ -206,92 +285,7 @@ async def process_and_send(message, target_lang, target_cids):
                 print(f"⚠️ 發送訊息至頻道 {cid} 失敗：{e}", flush=True)
 
 # ---------------------------------------------------------
-# 6. 事件監聽與指令
-# ---------------------------------------------------------
-
-@bot.tree.command(name="設定頻道", description="設定翻譯機器人的連動頻道與語言")
-@app_commands.describe(
-    channel="請選擇要綁定的頻道",
-    language="請選擇翻譯輸出的語言",
-    group="請輸入群組名稱"
-)
-@app_commands.choices(
-    language=[
-        app_commands.Choice(name="中文", value="ZH"),
-        app_commands.Choice(name="英文 (美式)", value="EN-US"),
-        app_commands.Choice(name="日文", value="JA"),
-        app_commands.Choice(name="韓文", value="KO"),
-        app_commands.Choice(name="俄文", value="RU"),
-        app_commands.Choice(name="印尼文", value="ID"),
-        app_commands.Choice(name="西班牙文", value="ES"),
-        app_commands.Choice(name="泰文", value="TH"),
-    ]
-)
-async def setup_channel(
-    interaction: discord.Interaction,
-    channel: discord.TextChannel,
-    language: app_commands.Choice[str],
-    group: str
-):
-    clean_group = str(group).strip()
-    CHANNEL_CONFIG[channel.id] = {
-        "lang": language.value,
-        "group": clean_group
-    }
-    save_config()
-
-    success_msg = (
-        f"✅ **設定成功！**\n"
-        f"📍 **目標頻道**：{channel.mention}\n"
-        f"🌐 **輸出語言**：{language.name}\n"
-        f"👥 **所屬群組**：`{clean_group}`"
-    )
-    await interaction.response.send_message(success_msg)
-
-@bot.tree.command(name="查詢設定", description="查看目前所有頻道的翻譯設定")
-async def check_config(interaction: discord.Interaction):
-    if not CHANNEL_CONFIG:
-        await interaction.response.send_message("目前沒有任何頻道設定喔！", ephemeral=True)
-        return
-
-    msg = "**當前翻譯頻道設定清單：**\n"
-    for cid, data in CHANNEL_CONFIG.items():
-        msg += f"<#{cid}> ➔ 群組: `{data['group']}` | 語言: `{data['lang']}`\n"
-
-    await interaction.response.send_message(msg, ephemeral=True)
-
-@bot.event
-async def on_message(message: discord.Message):
-    if message.author.bot or message.webhook_id is not None:
-        return
-
-    src_channel_id = message.channel.id
-
-    if src_channel_id in CHANNEL_CONFIG:
-        src_info = CHANNEL_CONFIG[src_channel_id]
-        current_group = str(src_info["group"]).strip()
-
-        lang_to_channels = {}
-
-        for cid, config in CHANNEL_CONFIG.items():
-            cfg_group = str(config["group"]).strip()
-            if cfg_group == current_group and cid != src_channel_id:
-                lang = config["lang"]
-                if lang not in lang_to_channels:
-                    lang_to_channels[lang] = []
-                lang_to_channels[lang].append(cid)
-
-        if lang_to_channels:
-            async with message.channel.typing():
-                tasks = []
-                for lang, target_cids in lang_to_channels.items():
-                    tasks.append(process_and_send(message, lang, target_cids))
-                await asyncio.gather(*tasks)
-
-    await bot.process_commands(message)
-
-# ---------------------------------------------------------
-# 7. 主程式
+# 6. 主程式 (修復 Session 被關閉問題與退避重試)
 # ---------------------------------------------------------
 
 async def main():
@@ -301,21 +295,21 @@ async def main():
         print("❌ 錯誤：找不到 DC_BOT_TOKEN 環境變數！", flush=True)
         return
 
-    retry_delay = 60  # 初始重試等待秒數
+    retry_delay = 60
 
     while True:
+        bot = create_bot()  # 每次連線重試均重新建立 Bot 實例，避免 Session Closed 錯誤
         try:
             print("🚀 嘗試連線至 Discord...", flush=True)
             async with bot:
                 await bot.start(BOT_TOKEN)
-            retry_delay = 60  # 連線順利關閉後重置等待時間
+            retry_delay = 60
 
         except discord.errors.HTTPException as e:
             if e.status == 429:
                 print(f"⚠️ Discord 429 限制，{retry_delay} 秒後重試...", flush=True)
                 await asyncio.sleep(retry_delay)
-                # 指數退避：重試間隔翻倍，最高 10 分鐘，避免連續請求被 Discrd 封鎖 IP
-                retry_delay = min(retry_delay * 2, 600)
+                retry_delay = min(retry_delay * 2, 600)  # 最長等待 10 分鐘
             else:
                 print(f"❌ 連線異常 ({e.status})，10 秒後重試...", flush=True)
                 await asyncio.sleep(10)
